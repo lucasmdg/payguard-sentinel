@@ -96,7 +96,7 @@ export default function PayGuardSentinelApp() {
         const msg =
           err instanceof Error
             ? err.message
-            : "Backend no disponible en http://localhost:8000";
+            : "Backend API no disponible";
         setToast({ level: "critical", text: msg });
       } finally {
         setLoadingInbox(false);

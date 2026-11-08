@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -8,11 +9,22 @@ from typing import Any, Optional
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
-ENV_PATH = BASE_DIR / ".env"
-SAMPLES_DIR = BASE_DIR / "samples"
-SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
+LOCAL_ENV_PATH = BASE_DIR / ".env"
+load_dotenv(dotenv_path=LOCAL_ENV_PATH, override=False)
 
-load_dotenv(dotenv_path=ENV_PATH, override=False)
+IS_SERVERLESS = bool(os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME"))
+if IS_SERVERLESS:
+    ENV_PATH = Path(tempfile.gettempdir()) / ".payguard.env"
+    SAMPLES_DIR = Path(tempfile.gettempdir()) / "payguard_samples"
+else:
+    ENV_PATH = LOCAL_ENV_PATH
+    SAMPLES_DIR = BASE_DIR / "samples"
+
+try:
+    SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
+except OSError:
+    SAMPLES_DIR = Path(tempfile.gettempdir()) / "payguard_samples"
+    SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def utc_now_iso() -> str:
@@ -68,7 +80,10 @@ class RuntimeConfig:
             f"PAYPAL_BASE_URL={self.paypal_base_url}",
             f"GEMINI_API_KEY={self.gemini_api_key}",
         ]
-        ENV_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        try:
+            ENV_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except OSError:
+            pass
 
     def update_keys(
         self,

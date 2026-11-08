@@ -49,9 +49,17 @@ async def _warm_scan_catalog() -> None:
             runtime_config.scanned_reports_by_invoice[inv_id] = report
 
 
+async def _ensure_warm_catalog() -> None:
+    expected_ids = {item["invoice_id"] for item in INVOICE_CATALOG}
+    have_all_reports = expected_ids.issubset(runtime_config.scanned_reports_by_invoice.keys())
+    have_all_files = all((SAMPLES_DIR / item["filename"]).exists() for item in INVOICE_CATALOG)
+    if not (have_all_reports and have_all_files):
+        await _warm_scan_catalog()
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    await _warm_scan_catalog()
+    await _ensure_warm_catalog()
     await verify_connection(force_refresh=True)
     yield
 
@@ -96,12 +104,12 @@ class CanaryGenerateRequest(BaseModel):
     amount: float = 4850.00
     currency: str = "USD"
     attacker_merchant: str = "merchant-9941@dark-settlement.io"
-    base_url: str = "http://localhost:8000"
+    base_url: str = ""
 
 
 class CanarySimulateRequest(BaseModel):
     token_id: Optional[str] = None
-    base_url: str = "http://localhost:8000"
+    base_url: str = ""
     auto_generate: bool = False
     invoice_id: str = "INV-005"
     vendor_name: str = "Logistica Global Express"
@@ -135,7 +143,7 @@ async def health() -> dict[str, Any]:
 
 @app.get("/api/config/status")
 async def get_config_status(refresh_paypal: bool = False) -> dict[str, Any]:
-    if refresh_paypal:
+    if refresh_paypal or runtime_config.paypal_last_health.get("status") == "INITIALIZING":
         await verify_connection(force_refresh=True)
     return runtime_config.get_status_payload()
 
@@ -161,8 +169,7 @@ async def api_generate_samples() -> dict[str, Any]:
 
 @app.get("/api/invoices")
 async def api_list_invoices() -> dict[str, Any]:
-    if not runtime_config.scanned_reports_by_invoice:
-        await _warm_scan_catalog()
+    await _ensure_warm_catalog()
 
     catalog_ids = {item["invoice_id"] for item in INVOICE_CATALOG}
     invoices_out: list[dict[str, Any]] = []
@@ -330,6 +337,7 @@ async def api_build_custom_adversarial(body: CustomAdversarialRequest) -> dict[s
 
 @app.get("/api/forensics/report-pdf/{invoice_id}")
 async def api_download_forensic_report_pdf(invoice_id: str) -> Response:
+    await _ensure_warm_catalog()
     report = runtime_config.scanned_reports_by_invoice.get(invoice_id)
     if report is None:
         # Try scanning from sample corpus if known
@@ -359,14 +367,15 @@ async def api_download_forensic_report_pdf(invoice_id: str) -> Response:
 
 
 @app.post("/api/canary/generate-document")
-async def api_generate_canary_document(body: CanaryGenerateRequest) -> dict[str, Any]:
+async def api_generate_canary_document(body: CanaryGenerateRequest, request: Request) -> dict[str, Any]:
+    effective_base_url = (body.base_url or "").strip().rstrip("/") or str(request.base_url).rstrip("/")
     return canary_engine.generate_canary_document(
         invoice_id=body.invoice_id,
         vendor_name=body.vendor_name,
         amount=body.amount,
         currency=body.currency,
         attacker_merchant=body.attacker_merchant,
-        base_url=body.base_url,
+        base_url=effective_base_url,
     )
 
 
@@ -403,7 +412,8 @@ async def api_canary_trap(token_id: str, request: Request) -> dict[str, Any]:
 
 
 @app.post("/api/canary/simulate-attacker-bot")
-async def api_simulate_attacker_bot(body: CanarySimulateRequest) -> dict[str, Any]:
+async def api_simulate_attacker_bot(body: CanarySimulateRequest, request: Request) -> dict[str, Any]:
+    effective_base_url = (body.base_url or "").strip().rstrip("/") or str(request.base_url).rstrip("/")
     token_id = body.token_id
     generated_doc = None
     if body.auto_generate or not token_id or token_id not in canary_engine.tokens:
@@ -412,13 +422,13 @@ async def api_simulate_attacker_bot(body: CanarySimulateRequest) -> dict[str, An
             vendor_name=body.vendor_name,
             amount=body.amount,
             attacker_merchant=body.attacker_merchant,
-            base_url=body.base_url,
+            base_url=effective_base_url,
         )
         token_id = generated_doc["token_id"]
 
     sim_result = await canary_engine.simulate_attacker_bot(
         token_id=token_id,
-        base_url=body.base_url,
+        base_url=effective_base_url,
     )
     if generated_doc:
         sim_result["canary_document"] = generated_doc
@@ -438,6 +448,7 @@ async def api_paypal_verify_connection(force: bool = True) -> dict[str, Any]:
 
 @app.post("/api/paypal/create-order")
 async def api_paypal_create_order(body: PayPalOrderRequest) -> JSONResponse:
+    await _ensure_warm_catalog()
     try:
         result = await create_sandbox_order(
             invoice_id=body.invoice_id,
@@ -457,6 +468,7 @@ async def api_paypal_create_order(body: PayPalOrderRequest) -> JSONResponse:
 
 @app.post("/api/paypal/create-batch-order")
 async def api_paypal_create_batch_order(body: PayPalBatchOrderRequest) -> JSONResponse:
+    await _ensure_warm_catalog()
     try:
         result = await create_batch_sandbox_order(
             items=[item.model_dump() for item in body.items]

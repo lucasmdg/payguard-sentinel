@@ -11,7 +11,13 @@ import type {
 } from "./types";
 
 export const API_BASE =
-  process.env.NEXT_PUBLIC_API_BASE_URL?.replace(/\/$/, "") || "http://localhost:8000";
+  process.env.NEXT_PUBLIC_API_BASE_URL?.replace(/\/$/, "") || "";
+
+function getOriginBase(): string {
+  if (API_BASE) return API_BASE;
+  if (typeof window !== "undefined") return window.location.origin;
+  return "";
+}
 
 async function parseJsonOrThrow<T>(res: Response): Promise<T> {
   const text = await res.text();
@@ -106,7 +112,7 @@ export async function generateCanaryDocument(payload: {
   const res = await fetch(`${API_BASE}/api/canary/generate-document`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ...payload, base_url: API_BASE }),
+    body: JSON.stringify({ ...payload, base_url: getOriginBase() }),
   });
   return parseJsonOrThrow<CanaryTokenRecord>(res);
 }
@@ -129,7 +135,7 @@ export async function simulateAttackerBot(payload: {
   const res = await fetch(`${API_BASE}/api/canary/simulate-attacker-bot`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ...payload, base_url: API_BASE }),
+    body: JSON.stringify({ ...payload, base_url: getOriginBase() }),
   });
   return parseJsonOrThrow(res);
 }

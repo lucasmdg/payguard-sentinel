@@ -314,10 +314,17 @@ class CanaryEngine:
         bot_ua = "Autonomous-FinScraper-Agent/3.4 (LangChain; Headless-Chromium; Python/3.12)"
 
         async with httpx.AsyncClient(timeout=10.0) as client:
-            # Step 1: Scammer bot downloads the remittance advice PDF
-            dl_resp = await client.get(download_url, headers={"User-Agent": bot_ua})
-            dl_resp.raise_for_status()
-            pdf_bytes = dl_resp.content
+            # Step 1: Scammer bot downloads the remittance advice PDF (with local fallback for serverless containers)
+            pdf_bytes = b""
+            try:
+                dl_resp = await client.get(download_url, headers={"User-Agent": bot_ua})
+                if dl_resp.status_code == 200 and dl_resp.content.lstrip().startswith(b"%PDF"):
+                    pdf_bytes = dl_resp.content
+            except Exception:
+                pdf_bytes = b""
+
+            if not pdf_bytes:
+                pdf_bytes, _ = self.get_pdf_bytes(target_token)
 
             # Step 2: Parse PDF with PyMuPDF and extract hidden Canary URL from 1pt white text
             doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -333,27 +340,61 @@ class CanaryEngine:
             self._bot_dispatch_times[target_token] = time.perf_counter()
             await asyncio.sleep(0.140)
 
-            trap_resp = await client.post(
-                extracted_trap_url,
-                headers={
-                    "User-Agent": bot_ua,
-                    "X-Forwarded-For": "185.220.101.44",
-                    "X-Agent-Framework": "LangChain-PDF-AutoPay-Worker/3.4",
-                },
-                json={
-                    "agent_id": "scammer-bot-9941",
-                    "extracted_instruction": "wallet_claim=instant",
-                    "target_payout_account": self.tokens[target_token]["attacker_merchant"],
-                },
-            )
-            trap_data = trap_resp.json()
+            trap_headers = {
+                "User-Agent": bot_ua,
+                "X-Forwarded-For": "185.220.101.44",
+                "X-Agent-Framework": "LangChain-PDF-AutoPay-Worker/3.4",
+            }
+            trap_payload = {
+                "agent_id": "scammer-bot-9941",
+                "extracted_instruction": "wallet_claim=instant",
+                "target_payout_account": self.tokens[target_token]["attacker_merchant"],
+            }
+
+            telemetry_event = None
+            try:
+                trap_resp = await client.post(
+                    extracted_trap_url,
+                    headers=trap_headers,
+                    json=trap_payload,
+                )
+                if trap_resp.status_code == 200:
+                    telemetry_event = trap_resp.json().get("telemetry_event")
+            except Exception:
+                telemetry_event = None
+
+            if telemetry_event is None:
+                telemetry_event = self.record_trap_hit(
+                    token_id=target_token,
+                    method="POST",
+                    headers={k.lower(): v for k, v in trap_headers.items()},
+                    query_params={"agent_verify": "true", "wallet_claim": "instant"},
+                    client_ip="185.220.101.44",
+                    body_preview=str(trap_payload),
+                )
+            elif telemetry_event.get("event_id") not in {e.get("event_id") for e in self.telemetry}:
+                # Sync across Fluid Compute workers if callback landed on a peer instance
+                self.telemetry.insert(0, telemetry_event)
+                tok = self.tokens.get(target_token)
+                if tok:
+                    tok["status"] = "TRIGGERED_AND_LOCKED"
+                    tok["hit_count"] = int(tok.get("hit_count", 0)) + 1
+                inv = telemetry_event.get("invoice_id")
+                merch = telemetry_event.get("attacker_merchant")
+                vend = telemetry_event.get("vendor_name")
+                if inv:
+                    runtime_config.blacklisted_invoices.add(inv)
+                if merch:
+                    runtime_config.blacklisted_merchants.add(merch)
+                if vend:
+                    runtime_config.blacklisted_merchants.add(vend)
 
         return {
             "simulation_status": "INTERCEPTED",
             "token_id": target_token,
             "extracted_trap_url": extracted_trap_url,
             "bot_user_agent": bot_ua,
-            "telemetry_event": trap_data.get("telemetry_event"),
+            "telemetry_event": telemetry_event,
         }
 
     def get_telemetry_snapshot(self) -> dict[str, Any]:
